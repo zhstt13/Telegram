@@ -41,31 +41,39 @@ jobs:
           from pathlib import Path
 
           ticket_path = Path("binary_hub/outbox/telegram/ticket.json")
+          manifest_path = Path("binary_hub/manifest.json")
           sent_path = Path("binary_hub/sent/telegram.json")
 
-          if not ticket_path.exists():
-              print("No Telegram ticket.")
+          def stop_without_send(message):
+              print(message)
               with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
                   f.write("should_send=false\n")
               raise SystemExit(0)
+
+          if not ticket_path.exists() or not manifest_path.exists():
+              stop_without_send("No active Telegram route.")
 
           ticket = json.loads(ticket_path.read_text(encoding="utf-8"))
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          latest = manifest.get("latest_file") or {}
+
+          if manifest.get("route") != "telegram":
+              stop_without_send("Current Binary Hub route is not Telegram.")
+
           if ticket.get("destination") != "telegram":
-              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
-                  f.write("should_send=false\n")
-              raise SystemExit(0)
+              stop_without_send("Telegram ticket is inactive.")
 
           request_id = str(ticket.get("request_id") or "")
+          if str(latest.get("request_id") or "") != request_id:
+              stop_without_send("Telegram ticket is stale.")
+
           if sent_path.exists():
               try:
                   sent = json.loads(sent_path.read_text(encoding="utf-8"))
               except json.JSONDecodeError:
                   sent = {}
               if request_id and sent.get("request_id") == request_id:
-                  print("This request was already sent.")
-                  with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
-                      f.write("should_send=false\n")
-                  raise SystemExit(0)
+                  stop_without_send("This request was already sent.")
 
           file_path = Path(ticket["canonical_path"])
           root = Path("binary_hub/inbox/google-drive")
