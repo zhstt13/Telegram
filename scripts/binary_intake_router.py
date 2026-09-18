@@ -4,7 +4,6 @@ from pathlib import Path
 
 ROOT = Path("binary_hub")
 MANIFEST = ROOT / "manifest.json"
-ROUTES = ROOT / "routes.json"
 
 
 def utc_now():
@@ -58,6 +57,16 @@ def _write_json(path, payload):
     )
 
 
+def _clear_stale_ticket(destination):
+    stale = (
+        ROOT / "edit-queue" / "ticket.json"
+        if destination == "telegram"
+        else ROOT / "outbox" / "telegram" / "ticket.json"
+    )
+    if stale.exists():
+        stale.unlink()
+
+
 def route_file(source_path, metadata, destination, request_id):
     source_path = Path(source_path)
     destination = normalize_destination(destination)
@@ -67,6 +76,8 @@ def route_file(source_path, metadata, destination, request_id):
         ticket_path = ROOT / "outbox" / "telegram" / "ticket.json"
     else:
         ticket_path = ROOT / "edit-queue" / "ticket.json"
+
+    _clear_stale_ticket(destination)
 
     ticket = {
         "version": 1,
