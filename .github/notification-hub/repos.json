@@ -1,0 +1,10 @@
+{
+  "repositories": [
+    {
+      "name": "TestLoPRax",
+      "full_name": "zhstt13/TestLoPRax",
+      "branch": "main",
+      "enabled": true
+    }
+  ]
+}
