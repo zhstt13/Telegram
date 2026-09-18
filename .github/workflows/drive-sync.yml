@@ -4,7 +4,13 @@ on:
   push:
     branches:
       - main
+    paths:
+      - "commands/command.json"
   workflow_dispatch:
+
+concurrency:
+  group: binary-drive-command
+  cancel-in-progress: false
 
 jobs:
   sync-drive:
@@ -16,32 +22,40 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Prepare folders
+      - name: Prepare Binary Hub
         run: |
-          mkdir -p imported/images
-          mkdir -p imported/pdf
+          mkdir -p binary_hub/inbox/google-drive
+          mkdir -p binary_hub/edit-queue
+          mkdir -p binary_hub/outbox/telegram
 
-      - name: Setup Google credentials
+      - name: Validate Google credentials
         env:
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
         run: |
-          echo "$GOOGLE_CREDENTIALS" > google-credentials.json
+          set -euo pipefail
+          test -n "$GOOGLE_CREDENTIALS"
 
       - name: Install dependencies
         run: |
-          pip install google-api-python-client google-auth
+          python -m pip install --disable-pip-version-check google-api-python-client google-auth
 
-      - name: Sync Drive files
+      - name: Intake latest Drive binary
         env:
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
-          GOOGLE_APPLICATION_CREDENTIALS: google-credentials.json
+          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
         run: |
+          set -euo pipefail
           python scripts/drive_sync.py
 
-      - name: Commit imported files
+      - name: Commit Binary Hub state
         run: |
-          git config --global user.name "github-actions"
-          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add imported/
-          git commit -m "Import files from Google Drive" || echo "No changes"
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add binary_hub/
+          if git diff --cached --quiet; then
+            echo "No Binary Hub changes"
+            exit 0
+          fi
+          git commit -m "Route latest Google Drive binary"
           git push
