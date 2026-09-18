@@ -1,2 +1,1 @@
-سلام 👋
-این پیام از ChatGPT از طریق GitHub Actions به تلگرام ارسال شده.
+Telegram Notification Hub با موفقیت راه‌اندازی شد. این پیام تست Workflow جدید است.
