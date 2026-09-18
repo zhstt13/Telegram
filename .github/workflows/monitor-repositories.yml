@@ -1,13 +1,7 @@
 name: Monitor Connected Repositories
 
 on:
-  schedule:
-    - cron: "*/5 * * * *"
   workflow_dispatch:
-  push:
-    paths:
-      - ".github/notification-hub/repos.json"
-      - ".github/workflows/monitor-repositories.yml"
 
 permissions:
   contents: write
