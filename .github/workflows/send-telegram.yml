@@ -1,26 +1,97 @@
-name: Telegram Message Sender
+name: Telegram Binary Dispatcher
 
 on:
+  workflow_run:
+    workflows:
+      - "Google Drive Sync Pipeline"
+    types:
+      - completed
   push:
     paths:
       - "message.txt"
-      - "imported/images/**"
   workflow_dispatch:
 
+concurrency:
+  group: telegram-dispatch
+  cancel-in-progress: false
+
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  send:
+  send-binary:
+    if: github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
 
     steps:
-      - name: Checkout repository
+      - name: Checkout latest main
         uses: actions/checkout@v4
+        with:
+          ref: main
 
-      - name: Validate secrets
+      - name: Resolve Telegram ticket
+        id: ticket
         shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          ticket_path = Path("binary_hub/outbox/telegram/ticket.json")
+          sent_path = Path("binary_hub/sent/telegram.json")
+
+          if not ticket_path.exists():
+              print("No Telegram ticket.")
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+                  f.write("should_send=false\n")
+              raise SystemExit(0)
+
+          ticket = json.loads(ticket_path.read_text(encoding="utf-8"))
+          if ticket.get("destination") != "telegram":
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+                  f.write("should_send=false\n")
+              raise SystemExit(0)
+
+          request_id = str(ticket.get("request_id") or "")
+          if sent_path.exists():
+              try:
+                  sent = json.loads(sent_path.read_text(encoding="utf-8"))
+              except json.JSONDecodeError:
+                  sent = {}
+              if request_id and sent.get("request_id") == request_id:
+                  print("This request was already sent.")
+                  with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+                      f.write("should_send=false\n")
+                  raise SystemExit(0)
+
+          file_path = Path(ticket["canonical_path"])
+          root = Path("binary_hub/inbox/google-drive")
+          try:
+              file_path.resolve().relative_to(root.resolve())
+          except ValueError:
+              raise SystemExit("Unsafe canonical_path in Telegram ticket")
+
+          if not file_path.is_file():
+              raise SystemExit(f"Binary file not found: {file_path}")
+
+          outputs = {
+              "should_send": "true",
+              "file_path": file_path.as_posix(),
+              "category": str(ticket.get("category") or "other"),
+              "mime_type": str(ticket.get("mime_type") or "application/octet-stream"),
+              "request_id": request_id,
+              "name": str(ticket.get("name") or file_path.name),
+          }
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              for key, value in outputs.items():
+                  f.write(f"{key}={value}\n")
+          PY
+
+      - name: Validate Telegram secrets
+        if: steps.ticket.outputs.should_send == 'true'
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -29,31 +100,101 @@ jobs:
           test -n "$TELEGRAM_BOT_TOKEN"
           test -n "$TELEGRAM_CHAT_ID"
 
-      - name: Send latest imported image
-        if: github.event_name == 'push'
+      - name: Send binary to Telegram
+        if: steps.ticket.outputs.should_send == 'true'
         shell: bash
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FILE_PATH: ${{ steps.ticket.outputs.file_path }}
+          CATEGORY: ${{ steps.ticket.outputs.category }}
+          MIME_TYPE: ${{ steps.ticket.outputs.mime_type }}
         run: |
           set -euo pipefail
-          IMAGE=$(find imported/images -type f \( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' \) -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2-)
-          test -n "$IMAGE"
-          curl --fail-with-body --silent --show-error \
-            --request POST \
-            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto" \
-            --form-string "chat_id=${TELEGRAM_CHAT_ID}" \
-            --form "photo=@${IMAGE}"
+          if [ "$CATEGORY" = "images" ]; then
+            if ! curl --fail-with-body --silent --show-error \
+              --request POST \
+              "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto" \
+              --form-string "chat_id=${TELEGRAM_CHAT_ID}" \
+              --form "photo=@${FILE_PATH};type=${MIME_TYPE}" \
+              > /tmp/telegram-response.json; then
+              curl --fail-with-body --silent --show-error \
+                --request POST \
+                "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
+                --form-string "chat_id=${TELEGRAM_CHAT_ID}" \
+                --form "document=@${FILE_PATH};type=${MIME_TYPE}" \
+                > /tmp/telegram-response.json
+            fi
+          else
+            curl --fail-with-body --silent --show-error \
+              --request POST \
+              "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
+              --form-string "chat_id=${TELEGRAM_CHAT_ID}" \
+              --form "document=@${FILE_PATH};type=${MIME_TYPE}" \
+              > /tmp/telegram-response.json
+          fi
+
+          python - <<'PY'
+          import json
+          response = json.load(open("/tmp/telegram-response.json", encoding="utf-8"))
+          if not response.get("ok"):
+              raise SystemExit(f"Telegram rejected payload: {response}")
+          print("Telegram send succeeded.")
+          PY
+
+      - name: Record successful Telegram delivery
+        if: steps.ticket.outputs.should_send == 'true'
+        shell: bash
+        env:
+          REQUEST_ID: ${{ steps.ticket.outputs.request_id }}
+          FILE_PATH: ${{ steps.ticket.outputs.file_path }}
+          FILE_NAME: ${{ steps.ticket.outputs.name }}
+        run: |
+          set -euo pipefail
+          mkdir -p binary_hub/sent
+          python - <<'PY'
+          import json
+          import os
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          payload = {
+              "request_id": os.environ.get("REQUEST_ID"),
+              "file": os.environ.get("FILE_NAME"),
+              "canonical_path": os.environ.get("FILE_PATH"),
+              "sent_at": datetime.now(timezone.utc).isoformat(),
+              "destination": "telegram",
+          }
+          Path("binary_hub/sent/telegram.json").write_text(
+              json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          PY
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add binary_hub/sent/telegram.json
+          git commit -m "Record Telegram binary delivery" || exit 0
+          git push
+
+  send-text:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Send text message
-        if: github.event_name == 'workflow_dispatch'
         shell: bash
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           set -euo pipefail
-          test -f message.txt
+          test -n "$TELEGRAM_BOT_TOKEN"
+          test -n "$TELEGRAM_CHAT_ID"
+          test -s message.txt
           curl --fail-with-body --silent --show-error \
             --request POST \
             "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
