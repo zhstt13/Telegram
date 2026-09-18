@@ -1,0 +1,153 @@
+name: Monitor Connected Repositories
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/notification-hub/repos.json"
+      - ".github/workflows/monitor-repositories.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: telegram-central-repo-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout Telegram hub
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check connected repositories
+        id: monitor
+        shell: python
+        env:
+          TELEGRAM_BOT_TOKEN: \${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: \${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          import json
+          import os
+          import subprocess
+          import urllib.parse
+          import urllib.request
+          from pathlib import Path
+
+          config_path = Path(".github/notification-hub/repos.json")
+          state_path = Path(".github/notification-hub/state.json")
+
+          config = json.loads(config_path.read_text(encoding="utf-8"))
+          state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
+
+          token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+          chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+
+          if not token or not chat_id:
+              raise SystemExit("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID.")
+
+          changed = False
+
+          for item in config.get("repositories", []):
+              if not item.get("enabled", True):
+                  continue
+
+              full_name = item["full_name"].strip()
+              branch = item.get("branch", "main").strip()
+              display_name = item.get("name", full_name.split("/")[-1]).strip()
+
+              remote = f"https://github.com/{full_name}.git"
+              ref = f"refs/heads/{branch}"
+
+              result = subprocess.run(
+                  ["git", "ls-remote", remote, ref],
+                  check=True,
+                  capture_output=True,
+                  text=True,
+              )
+
+              output = result.stdout.strip()
+              if not output:
+                  print(f"No ref found for {full_name}@{branch}")
+                  continue
+
+              latest_sha = output.split()[0]
+              key = f"{full_name}@{branch}"
+              previous_sha = state.get(key)
+
+              if not previous_sha:
+                  state[key] = latest_sha
+                  changed = True
+                  print(f"Initialized {key} at {latest_sha[:7]}")
+                  continue
+
+              if latest_sha == previous_sha:
+                  print(f"No change: {key} {latest_sha[:7]}")
+                  continue
+
+              commit_url = f"https://github.com/{full_name}/commit/{latest_sha}"
+              message = (
+                  f"🔔 {display_name}\n"
+                  f"Event: New commit\n"
+                  f"Repo: {full_name}\n"
+                  f"Branch: {branch}\n"
+                  f"Commit: {latest_sha[:7]}\n\n"
+                  f"{commit_url}"
+              )
+
+              data = urllib.parse.urlencode(
+                  {
+                      "chat_id": chat_id,
+                      "text": message,
+                  }
+              ).encode("utf-8")
+
+              request = urllib.request.Request(
+                  f"https://api.telegram.org/bot{token}/sendMessage",
+                  data=data,
+                  method="POST",
+              )
+
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  body = response.read().decode("utf-8")
+                  if response.status != 200:
+                      raise RuntimeError(body)
+
+              print(f"Notification sent for {key}: {previous_sha[:7]} -> {latest_sha[:7]}")
+              state[key] = latest_sha
+              changed = True
+
+          if changed:
+              state_path.write_text(
+                  json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+                  encoding="utf-8",
+              )
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"state_changed={'true' if changed else 'false'}\n")
+
+      - name: Persist monitor state
+        if: steps.monitor.outputs.state_changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if git diff --quiet -- .github/notification-hub/state.json; then
+            echo "No persisted state change."
+            exit 0
+          fi
+
+          git config user.name "telegram-notification-hub"
+          git config user.email "telegram-notification-hub@users.noreply.github.com"
+
+          git add .github/notification-hub/state.json
+          git commit -m "Update notification monitor state [skip ci]"
+          git pull --rebase
+          git push
