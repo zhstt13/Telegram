@@ -1,58 +1,183 @@
-name: Send message to Telegram
+name: Telegram Notification Hub
 
 on:
   push:
     paths:
       - "message.txt"
+
+  repository_dispatch:
+    types: [notify]
+
   workflow_dispatch:
+    inputs:
+      project:
+        description: "Project / repository name"
+        required: false
+        default: "Manual"
+        type: string
+      event:
+        description: "Event name"
+        required: false
+        default: "Manual notification"
+        type: string
+      status:
+        description: "Status: success, failure, warning, info"
+        required: false
+        default: "info"
+        type: choice
+        options:
+          - info
+          - success
+          - failure
+          - warning
+      message:
+        description: "Notification message"
+        required: true
+        type: string
+      url:
+        description: "Optional URL"
+        required: false
+        type: string
 
 permissions:
   contents: read
 
+concurrency:
+  group: telegram-notification-hub
+  cancel-in-progress: false
+
 jobs:
   send:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Validate required secrets
+      - name: Validate secrets
         shell: bash
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_BOT_TOKEN: \${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: \${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           set -euo pipefail
+
           if [ -z "$TELEGRAM_BOT_TOKEN" ]; then
-            echo "Missing TELEGRAM_BOT_TOKEN secret."
-            exit 1
-          fi
-          if [ -z "$TELEGRAM_CHAT_ID" ]; then
-            echo "Missing TELEGRAM_CHAT_ID secret."
+            echo "::error::Missing TELEGRAM_BOT_TOKEN repository secret."
             exit 1
           fi
 
-      - name: Send message
+          if [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "::error::Missing TELEGRAM_CHAT_ID repository secret."
+            exit 1
+          fi
+
+      - name: Build notification payload
+        id: payload
+        shell: python
+        env:
+          EVENT_NAME: \${{ github.event_name }}
+          SOURCE_REPOSITORY: \${{ github.event.client_payload.repository || github.repository }}
+          SOURCE_PROJECT: \${{ github.event.client_payload.project || inputs.project || '' }}
+          SOURCE_EVENT: \${{ github.event.client_payload.event || inputs.event || '' }}
+          SOURCE_STATUS: \${{ github.event.client_payload.status || inputs.status || 'info' }}
+          SOURCE_MESSAGE: \${{ github.event.client_payload.message || inputs.message || '' }}
+          SOURCE_BRANCH: \${{ github.event.client_payload.branch || github.ref_name }}
+          SOURCE_COMMIT: \${{ github.event.client_payload.commit || github.sha }}
+          SOURCE_ACTOR: \${{ github.event.client_payload.actor || github.actor }}
+          SOURCE_URL: \${{ github.event.client_payload.url || inputs.url || '' }}
+        run: |
+          import os
+          from pathlib import Path
+
+          event_name = os.getenv("EVENT_NAME", "")
+          repository = os.getenv("SOURCE_REPOSITORY", "").strip()
+          project = os.getenv("SOURCE_PROJECT", "").strip()
+          event = os.getenv("SOURCE_EVENT", "").strip()
+          status = os.getenv("SOURCE_STATUS", "info").strip().lower()
+          message = os.getenv("SOURCE_MESSAGE", "").strip()
+          branch = os.getenv("SOURCE_BRANCH", "").strip()
+          commit = os.getenv("SOURCE_COMMIT", "").strip()
+          actor = os.getenv("SOURCE_ACTOR", "").strip()
+          url = os.getenv("SOURCE_URL", "").strip()
+
+          if event_name == "push":
+              message = Path("message.txt").read_text(encoding="utf-8").strip()
+              project = project or repository.split("/")[-1] or "Telegram"
+              event = event or "Message updated"
+              status = "info"
+
+          if not message:
+              raise SystemExit("Notification message is empty.")
+
+          icons = {
+              "success": "✅",
+              "failure": "❌",
+              "warning": "⚠️",
+              "info": "ℹ️",
+          }
+
+          icon = icons.get(status, "ℹ️")
+          title = project or repository or "GitHub"
+
+          lines = [f"{icon} {title}"]
+
+          if event:
+              lines.append(f"Event: {event}")
+          if repository and repository != title:
+              lines.append(f"Repo: {repository}")
+          if branch:
+              lines.append(f"Branch: {branch}")
+          if commit:
+              lines.append(f"Commit: {commit[:7]}")
+          if actor:
+              lines.append(f"Actor: {actor}")
+
+          lines.extend(["", message])
+
+          if url:
+              lines.extend(["", url])
+
+          text = "\\n".join(lines).strip()
+
+          if len(text) > 4000:
+              text = text[:3997] + "..."
+
+          output_path = os.environ["GITHUB_OUTPUT"]
+          with open(output_path, "a", encoding="utf-8") as fh:
+              fh.write("text<<EOF\\n")
+              fh.write(text)
+              fh.write("\\nEOF\\n")
+
+      - name: Send to Telegram
         shell: bash
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_BOT_TOKEN: \${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: \${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_TEXT: \${{ steps.payload.outputs.text }}
         run: |
           set -euo pipefail
 
-          MESSAGE="$(cat message.txt)"
+          response="$(
+            curl --fail-with-body --silent --show-error \
+              --request POST \
+              "https://api.telegram.org/bot\${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=\${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=\${TELEGRAM_TEXT}"
+          )"
 
-          if [ -z "$MESSAGE" ]; then
-            echo "message.txt is empty."
-            exit 1
-          fi
+          echo "$response"
 
-          curl --fail-with-body --silent --show-error \
-            --request POST \
-            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-            --data-urlencode "text=${MESSAGE}"
-
-          echo
-          echo "Telegram message sent successfully."
+      - name: Summary
+        shell: bash
+        env:
+          TELEGRAM_TEXT: \${{ steps.payload.outputs.text }}
+        run: |
+          {
+            echo "## Telegram notification sent"
+            echo
+            echo '~~~text'
+            echo "$TELEGRAM_TEXT"
+            echo '~~~'
+          } >> "$GITHUB_STEP_SUMMARY"
