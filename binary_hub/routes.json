@@ -1,0 +1,7 @@
+{
+  "default": "edit-queue",
+  "routes": {
+    "telegram": "outbox/telegram",
+    "edit": "edit-queue"
+  }
+}
