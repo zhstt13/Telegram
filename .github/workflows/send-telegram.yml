@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - "message.txt"
+      - "outbox/photo.jpg"
   workflow_dispatch:
 
 permissions:
@@ -17,6 +18,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
 
       - name: Validate secrets
         shell: bash
@@ -28,7 +31,41 @@ jobs:
           test -n "$TELEGRAM_BOT_TOKEN" || { echo "Missing TELEGRAM_BOT_TOKEN"; exit 1; }
           test -n "$TELEGRAM_CHAT_ID" || { echo "Missing TELEGRAM_CHAT_ID"; exit 1; }
 
-      - name: Send message.txt to Telegram
+      - name: Detect changed payload
+        id: changed
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "message=true" >> "$GITHUB_OUTPUT"
+            echo "photo=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          BEFORE="${{ github.event.before }}"
+          AFTER="${{ github.sha }}"
+
+          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            CHANGED="$(git show --pretty='' --name-only "$AFTER")"
+          else
+            CHANGED="$(git diff --name-only "$BEFORE" "$AFTER")"
+          fi
+
+          if echo "$CHANGED" | grep -Fxq "message.txt"; then
+            echo "message=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "message=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          if echo "$CHANGED" | grep -Fxq "outbox/photo.jpg"; then
+            echo "photo=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "photo=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Send text message
+        if: steps.changed.outputs.message == 'true'
         shell: bash
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -44,5 +81,18 @@ jobs:
             --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
             --data-urlencode "text=${MESSAGE}"
 
-          echo
-          echo "Telegram message sent successfully."
+      - name: Send photo
+        if: steps.changed.outputs.photo == 'true'
+        shell: bash
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set -euo pipefail
+          test -s "outbox/photo.jpg" || { echo "outbox/photo.jpg missing or empty"; exit 1; }
+
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto" \
+            --form-string "chat_id=${TELEGRAM_CHAT_ID}" \
+            --form "photo=@outbox/photo.jpg"
