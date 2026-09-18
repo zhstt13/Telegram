@@ -4,7 +4,7 @@ on:
   push:
     paths:
       - "message.txt"
-      - "outbox/photo.jpg"
+      - "outbox/send-photo.trigger"
   workflow_dispatch:
 
 permissions:
@@ -58,7 +58,7 @@ jobs:
             echo "message=false" >> "$GITHUB_OUTPUT"
           fi
 
-          if echo "$CHANGED" | grep -Fxq "outbox/photo.jpg"; then
+          if echo "$CHANGED" | grep -Fxq "outbox/send-photo.trigger"; then
             echo "photo=true" >> "$GITHUB_OUTPUT"
           else
             echo "photo=false" >> "$GITHUB_OUTPUT"
@@ -81,7 +81,7 @@ jobs:
             --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
             --data-urlencode "text=${MESSAGE}"
 
-      - name: Send photo
+      - name: Rebuild and send photo
         if: steps.changed.outputs.photo == 'true'
         shell: bash
         env:
@@ -89,10 +89,24 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           set -euo pipefail
-          test -s "outbox/photo.jpg" || { echo "outbox/photo.jpg missing or empty"; exit 1; }
+
+          source outbox/send-photo.trigger
+          test -n "${PARTS:-}" || { echo "PARTS missing"; exit 1; }
+          test -n "${SHA256:-}" || { echo "SHA256 missing"; exit 1; }
+
+          : > /tmp/photo.b64
+          for i in $(seq -w 1 "$PARTS"); do
+            part="outbox/photo_parts/part-${i}.b64"
+            test -s "$part" || { echo "Missing $part"; exit 1; }
+            cat "$part" >> /tmp/photo.b64
+          done
+
+          base64 --decode /tmp/photo.b64 > /tmp/photo.jpg
+          test -s /tmp/photo.jpg || { echo "Decoded photo is empty"; exit 1; }
+          echo "${SHA256}  /tmp/photo.jpg" | sha256sum --check -
 
           curl --fail-with-body --silent --show-error \
             --request POST \
             "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto" \
             --form-string "chat_id=${TELEGRAM_CHAT_ID}" \
-            --form "photo=@outbox/photo.jpg"
+            --form "photo=@/tmp/photo.jpg;type=image/jpeg"
